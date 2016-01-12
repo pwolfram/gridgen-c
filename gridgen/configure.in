@@ -71,6 +71,11 @@ fi
 
 AC_CHECK_LIB(gu, gridnodes_readnextpoint, , AC_MSG_WARN([unable to find library libgu; you will not be able to build the shared library]))
 
+AC_OPENMP
+
+CFLAGS="$CFLAGS $OPENMP_CFLAGS"
+CFLAGS_TRIANGLE="$CFLAGS_TRIANGLE $OPENMP_CFLAGS"
+LDFLAGS="$LDFLAGS $OPENMP_CFLAGS"
 AC_SUBST(NOCOMPLEX)
 AC_SUBST(CC)
 AC_SUBST(CFLAGS)

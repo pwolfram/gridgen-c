@@ -47,6 +47,7 @@
 #include "version.h"
 #include "config.h"
 #include "nan.h"
+#include "omp.h"
 
 #define BUFSIZE 1024
 #define NMIN 3                  /* minimal number of vertices */
@@ -256,6 +257,11 @@ typedef struct {
      * temporal stuff -- some output of interest to me. Ignore it. 
      */
     int diagonal;
+    /*
+     * new temp storage for output points PJW
+     */
+    double* xstore;
+    double* ystore;
 } gridgen;
 
 void gridgen_setverbose(int verbose)
@@ -1973,7 +1979,8 @@ static void output_point(gridgen* gg, double x, double y)
     if (gg->gn == NULL) {
 #endif
         if (!isnan(x))
-            fprintf(gg->out, "%.10g %.10g\n", x, y);
+            //fprintf(gg->out, "%.10g %.10g\n", x, y);
+            fprintf(gg->out, "%20.16e %20.16e\n", x, y);
         else
             fprintf(gg->out, "NaN NaN\n");
         fflush(gg->out);
@@ -1983,7 +1990,51 @@ static void output_point(gridgen* gg, double x, double y)
 #endif
 }
 
-static void map_point(gridgen* gg, zdouble z)
+static void output_point_init(gridgen* gg, int numpoints)
+{
+  int ii;
+  gg->xstore = malloc(numpoints * sizeof(double));
+  gg->ystore = malloc(numpoints * sizeof(double));
+  for (ii=0; ii < numpoints; ii++) {
+    gg->xstore[ii] = NaN;
+    gg->ystore[ii] = NaN;
+  }
+}
+
+static void output_point_save(gridgen* gg, double* xstore, double* ystore, double x, double y)
+{
+
+#if !defined(GRIDGEN_STANDALONE) && defined(HAVE_GRIDNODES_H)
+    if (gg->gn == NULL) {
+#endif
+        if (!isnan(x)) {
+            //fprintf(gg->out, "%20.16e %20.16e\n", x, y);
+            *xstore = x;
+            *ystore = y;
+        }
+        //else {
+        //    //fprintf(gg->out, "NaN NaN\n");
+        //    *xstore = NaN;
+        //    *ystore = NaN;
+        //}
+        //fflush(gg->out);
+#if !defined(GRIDGEN_STANDALONE) && defined(HAVE_GRIDNODES_H)
+    } else
+        gridnodes_readnextpoint(gg->gn, x, y);
+#endif
+}
+
+static int output_points_fprintf(gridgen* gg, double* xstore, double *ystore, int numpoints) {
+  int ii, count=0;
+  for (ii=0; ii < numpoints; ii++)  {
+    fprintf(gg->out, "%20.16e %20.16e\n",xstore[ii],ystore[ii]);
+    if(!(isnan(xstore[ii]) | isnan(ystore[ii])))
+      count++;
+  }
+  return count;
+}
+
+static void map_point(gridgen* gg, zdouble z, int apoint)
 {
     zdouble zz = NaN;
     double eps = gg->eps;
@@ -2038,9 +2089,11 @@ static void map_point(gridgen* gg, zdouble z)
         zz = sc_w2z(gg->sc, w, vid, ZZERO, gg->As[qid], -1, gg->Bs[qid], &ws[qid * nz]);
         if (status != 0)
             (void) z2q_simple(gg, zz, gg->zs, eps);
-        output_point(gg, creal(zz), cimag(zz));
+        //output_point(gg, creal(zz), cimag(zz));
+        output_point_save(gg, &gg->xstore[apoint], &gg->ystore[apoint], creal(zz), cimag(zz));
     } else {
-        output_point(gg, NaN, NaN);
+        //output_point(gg, NaN, NaN);
+        output_point_save(gg,  &gg->xstore[apoint], &gg->ystore[apoint], NaN, NaN);
     }
     if (gg_verbose && gg->out != stdout) {
         if (gg_verbose > 1)
@@ -2239,8 +2292,10 @@ static void map_quadrilaterals(gridgen* gg)
 
 static void generate_grid(gridgen* gg)
 {
+    //omp_set_num_threads(12);
+    omp_set_nested(1);
     int count = 0;
-    int i, j;
+    int i, j, apoint,nstores;
 
     if (gg_verbose) {
         fprintf(stderr, "generating grid:\n");
@@ -2253,48 +2308,71 @@ static void generate_grid(gridgen* gg)
     if (gg_verbose == 1 && gg->out != stdout)
         fprintf(stderr, "  ");
 
+
     if (gg->gridpoints == NULL) {
-        int nx = gg->nx;
-        int ny = gg->ny;
-        double dzx = (gg->newxmax - gg->newxmin) / (nx - 1);
-        double dzy = (gg->newymax - gg->newymin) / (ny - 1);
-        zdouble z0 = gg->newxmin + I * gg->newymin;
+      int nx = gg->nx;
+      int ny = gg->ny;
+      // allocate temp memory for point storage
+      output_point_init(gg, ny*nx);
+      double dzx = (gg->newxmax - gg->newxmin) / (nx - 1);
+      double dzy = (gg->newymax - gg->newymin) / (ny - 1);
+      zdouble z0 = gg->newxmin + I * gg->newymin;
 
-        if (gg->out != NULL)
-            fprintf(gg->out, "## %d x %d\n", nx, ny);
+      if (gg->out != NULL)
+        fprintf(gg->out, "## %d x %d\n", nx, ny);
 
-        for (j = 0; j < ny; ++j) {
-            zdouble zy = z0 + I * dzy * j;
+      //#pragma omp parallel for schedule(dynamic,1) private(i,j,apoint)
+      for (j = 0; j < ny; ++j) {
+        zdouble zy = z0 + I * dzy * j;
 
-            for (i = 0; i < nx; ++i) {
-                zdouble z = zy + dzx * i;
+        // dynamic scheduling each time since the NaNs are so fast...
+        #pragma omp parallel for schedule(dynamic,1) private(i,apoint)
+        for (i = 0; i < nx; ++i) {
+          zdouble z = zy + dzx * i;
 
-                align_onboundaries(gg, &z);
-                if (in_poly(z, gg->ncorners, gg->newrzs, gg->eps)) {
-                    map_point(gg, z);
-                    count++;
-                } else
-                    output_point(gg, NaN, NaN);
-            }
+          align_onboundaries(gg, &z);
+          apoint = j*nx + i;
+          if (in_poly(z, gg->ncorners, gg->newrzs, gg->eps)) {
+            map_point(gg, z, apoint);
+            //count++;
+          } else {
+            //output_point(gg, NaN, NaN);
+            output_point_save(gg,  &gg->xstore[apoint], &gg->ystore[apoint], NaN, NaN);
+          }
         }
+      }
+      nstores = nx*ny;
     } else {
         double dzx = gg->newxmax - gg->newxmin;
         double dzy = gg->newymax - gg->newymin;
         zdouble z0 = gg->newxmin + I * gg->newymin;
         int n = gg->ngridpoints;
+        // allocate temp memory for point storage
+        output_point_init(gg, n);
         zdouble* zs = (zdouble*) gg->gridpoints;
 
         for (i = 0; i < n; ++i) {
             zdouble z = z0 + creal(zs[i]) * dzx + I * cimag(zs[i]) * dzy;
 
             align_onboundaries(gg, &z);
+            apoint = i;
             if (in_poly(z, gg->ncorners, gg->newrzs, gg->eps)) {
-                map_point(gg, z);
-                count++;
-            } else
-                output_point(gg, NaN, NaN);
+                map_point(gg, z, apoint);
+                //count++;
+            } else {
+                //output_point(gg, NaN, NaN);
+                output_point_save(gg,  &gg->xstore[apoint], &gg->ystore[apoint], NaN, NaN);
+            }
         }
+        nstores = n;
     }
+    // output temp memory to file, output count to fix race condition
+    count = output_points_fprintf(gg, gg->xstore, gg->ystore, nstores);
+
+
+    // free temp memory
+    free(gg->xstore);
+    free(gg->ystore);
 
     if (gg_verbose)
         fprintf(stderr, " (%d nodes)\n", count);
